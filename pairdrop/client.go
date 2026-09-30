@@ -1,20 +1,18 @@
-package main
+package pairdrop
 
 import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -80,6 +78,7 @@ type incomingFile struct {
 }
 
 type remotePeer struct {
+	owner    *Node
 	id       string
 	roomType string
 	roomID   string
@@ -97,21 +96,16 @@ type remotePeer struct {
 }
 
 type Node struct {
-	wsConn *websocket.Conn
-	wsMu   sync.Mutex
-	peers  map[string]*remotePeer
-	mu     sync.Mutex
-	room   string
-}
-
-func main() {
-	room := flag.String("room", "", "PairDrop 五字符公共房间；留空则加入同公网 IP 房间")
-	flag.Parse()
-
-	node := &Node{peers: make(map[string]*remotePeer), room: strings.ToLower(*room)}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	node.run(ctx, pairDropURL, 3*time.Second)
+	config  Config
+	running atomic.Bool
+	viewMu  sync.Mutex
+	view    Snapshot
+	rtc     webrtc.Configuration
+	wsConn  *websocket.Conn
+	wsMu    sync.Mutex
+	peers   map[string]*remotePeer
+	mu      sync.Mutex
+	room    string
 }
 
 func (node *Node) run(ctx context.Context, endpoint string, retryDelay time.Duration) {
@@ -121,7 +115,8 @@ func (node *Node) run(ctx context.Context, endpoint string, retryDelay time.Dura
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("信令连接中断: %v；%s 后自动重连", err, retryDelay)
+		node.setStatus("等待重连", "")
+		node.logf("信令连接中断: %v；%s 后自动重连", err, retryDelay)
 		timer := time.NewTimer(retryDelay)
 		select {
 		case <-ctx.Done():
@@ -137,7 +132,7 @@ func (node *Node) connect(ctx context.Context, endpoint string) error {
 	header.Set("User-Agent", "PairDrop-Go-Receiver/1.0")
 
 	wsURL := endpoint
-	if saved, err := loadIdentity(); err == nil && saved.PeerID != "" && saved.PeerIDHash != "" {
+	if saved, err := loadIdentity(node.config.IdentityPath); err == nil && saved.PeerID != "" && saved.PeerIDHash != "" {
 		u, err := url.Parse(endpoint)
 		if err != nil {
 			return err
@@ -147,10 +142,11 @@ func (node *Node) connect(ctx context.Context, endpoint string) error {
 		q.Set("peer_id_hash", saved.PeerIDHash)
 		u.RawQuery = q.Encode()
 		wsURL = u.String()
-		log.Printf("复用 PairDrop 身份: %s", saved.PeerID)
+		node.logf("复用 PairDrop 身份: %s", saved.PeerID)
 	}
 
-	log.Printf("正在连接 PairDrop 信令服务器: %s", endpoint)
+	node.setStatus("连接中", "")
+	node.logf("正在连接 PairDrop 信令服务器: %s", endpoint)
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 15 * time.Second
 	conn, _, err := dialer.DialContext(ctx, wsURL, header)
@@ -162,7 +158,7 @@ func (node *Node) connect(ctx context.Context, endpoint string) error {
 	node.wsMu.Unlock()
 	cancelClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer cancelClose()
-	log.Printf("已连接，等待服务器分配身份...")
+	node.logf("已连接，等待服务器分配身份...")
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -171,7 +167,7 @@ func (node *Node) connect(ctx context.Context, endpoint string) error {
 			return err
 		}
 		if err := node.handleServerMessage(raw); err != nil {
-			log.Printf("处理信令失败: %v", err)
+			node.logf("处理信令失败: %v", err)
 		}
 	}
 }
@@ -217,35 +213,46 @@ func (n *Node) handleServerMessage(raw []byte) error {
 	case "ping":
 		return n.sendWS(map[string]any{"type": "pong"})
 	case "ws-config":
+		var cfg struct {
+			WSConfig struct {
+				RTCConfig webrtc.Configuration `json:"rtcConfig"`
+			} `json:"wsConfig"`
+		}
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return err
+		}
+		n.rtc = cfg.WSConfig.RTCConfig
 		return nil
 	case "display-name":
-		log.Printf("身份已分配: %s (%s)，设备: %s", msg.DisplayName, msg.PeerID, msg.DeviceName)
+		n.setStatus("已连接", msg.DisplayName)
+		n.logf("身份已分配: %s (%s)，设备: %s", msg.DisplayName, msg.PeerID, msg.DeviceName)
 		if msg.PeerID != "" && msg.PeerIDHash != "" {
-			if err := saveIdentity(identity{PeerID: msg.PeerID, PeerIDHash: msg.PeerIDHash}); err != nil {
-				log.Printf("保存 PairDrop 身份失败: %v", err)
+			if err := saveIdentity(n.config.IdentityPath, identity{PeerID: msg.PeerID, PeerIDHash: msg.PeerIDHash}); err != nil {
+				n.logf("保存 PairDrop 身份失败: %v", err)
 			}
 		}
 		if n.room != "" {
-			log.Printf("正在加入公共房间: %s", n.room)
+			n.logf("正在加入公共房间: %s", n.room)
 			return n.sendWS(map[string]any{
 				"type":            "join-public-room",
 				"publicRoomId":    n.room,
 				"createIfInvalid": true,
 			})
 		}
-		log.Printf("正在加入同公网 IP 房间；请在同一网络打开 https://pairdrop.net")
+		n.logf("正在加入同公网 IP 房间；请在同一网络打开 https://pairdrop.net")
 		return n.sendWS(map[string]any{"type": "join-ip-room"})
 	case "public-room-id-invalid":
 		return fmt.Errorf("公共房间 %q 无效", msg.PublicRoom)
 	case "peers":
-		log.Printf("房间内已有 %d 个设备", len(msg.Peers))
+		n.logf("房间内已有 %d 个设备", len(msg.Peers))
 		for _, info := range msg.Peers {
 			if !info.RTCSupported {
 				continue
 			}
-			log.Printf("发现设备: %s / %s (%s)", info.Name.DisplayName, info.Name.DeviceName, info.ID)
+			n.device(info.ID, info.Name.DisplayName+" / "+info.Name.DeviceName, "发现")
+			n.logf("发现设备: %s / %s (%s)", info.Name.DisplayName, info.Name.DeviceName, info.ID)
 			if _, err := n.ensurePeer(info.ID, msg.RoomType, msg.RoomID, true); err != nil {
-				log.Printf("连接设备失败: %v", err)
+				n.logf("连接设备失败: %v", err)
 			}
 		}
 		return nil
@@ -253,7 +260,8 @@ func (n *Node) handleServerMessage(raw []byte) error {
 		if msg.Peer == nil || !msg.Peer.RTCSupported {
 			return nil
 		}
-		log.Printf("新设备加入: %s / %s (%s)", msg.Peer.Name.DisplayName, msg.Peer.Name.DeviceName, msg.Peer.ID)
+		n.device(msg.Peer.ID, msg.Peer.Name.DisplayName+" / "+msg.Peer.Name.DeviceName, "发现")
+		n.logf("新设备加入: %s / %s (%s)", msg.Peer.Name.DisplayName, msg.Peer.Name.DeviceName, msg.Peer.ID)
 		_, err := n.ensurePeer(msg.Peer.ID, msg.RoomType, msg.RoomID, false)
 		return err
 	case "peer-left":
@@ -269,13 +277,13 @@ func (n *Node) handleServerMessage(raw []byte) error {
 		}
 		return n.handleSignal(peer, &msg)
 	default:
-		log.Printf("收到服务端消息: %s", msg.Type)
+		n.logf("收到服务端消息: %s", msg.Type)
 		return nil
 	}
 }
 
-func loadIdentity() (identity, error) {
-	data, err := os.ReadFile(identityFile)
+func loadIdentity(path string) (identity, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return identity{}, err
 	}
@@ -286,16 +294,16 @@ func loadIdentity() (identity, error) {
 	return saved, nil
 }
 
-func saveIdentity(saved identity) error {
+func saveIdentity(path string, saved identity) error {
 	data, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
 	}
-	temp := identityFile + ".tmp"
+	temp := path + ".tmp"
 	if err := os.WriteFile(temp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(temp, identityFile)
+	return os.Rename(temp, path)
 }
 
 func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer, error) {
@@ -311,13 +319,11 @@ func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer
 	}
 	n.mu.Unlock()
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-	})
+	pc, err := webrtc.NewPeerConnection(n.rtc)
 	if err != nil {
 		return nil, err
 	}
-	peer := &remotePeer{id: id, roomType: roomType, roomID: roomID, pc: pc}
+	peer := &remotePeer{owner: n, id: id, roomType: roomType, roomID: roomID, pc: pc}
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
@@ -325,11 +331,12 @@ func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer
 		}
 		ice := candidate.ToJSON()
 		if err := n.sendSignal(peer, nil, &ice); err != nil {
-			log.Printf("发送 ICE Candidate 失败: %v", err)
+			n.logf("发送 ICE Candidate 失败: %v", err)
 		}
 	})
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("设备 [%s] WebRTC 状态: %s", id, state)
+		n.device(id, "", state.String())
+		n.logf("设备 [%s] WebRTC 状态: %s", id, state)
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 			n.removePeerIfCurrent(id, peer)
 		}
@@ -392,7 +399,7 @@ func (n *Node) handleSignal(peer *remotePeer, msg *SignalMessage) error {
 		peer.mu.Unlock()
 		for _, candidate := range pending {
 			if err := peer.pc.AddICECandidate(candidate); err != nil {
-				log.Printf("添加缓存 ICE Candidate 失败: %v", err)
+				n.logf("添加缓存 ICE Candidate 失败: %v", err)
 			}
 		}
 		if msg.SDP.Type == webrtc.SDPTypeOffer {
@@ -425,11 +432,12 @@ func (n *Node) bindDataChannel(peer *remotePeer, dc *webrtc.DataChannel) {
 	peer.dc = dc
 	peer.mu.Unlock()
 	dc.OnOpen(func() {
-		log.Printf("已与设备 [%s] 建立数据通道，可以从网页端发送文件", peer.id)
+		n.device(peer.id, "", "可接收文件")
+		n.logf("已与设备 [%s] 建立数据通道，可以从网页端发送文件", peer.id)
 	})
 	dc.OnMessage(func(message webrtc.DataChannelMessage) {
 		if err := peer.handleDataMessage(message); err != nil {
-			log.Printf("处理来自 [%s] 的数据失败: %v", peer.id, err)
+			n.logf("处理来自 [%s] 的数据失败: %v", peer.id, err)
 			peer.abortIncomingFileSafely()
 		}
 	})
@@ -451,11 +459,24 @@ func (p *remotePeer) handleDataMessage(message webrtc.DataChannelMessage) error 
 		if len(msg.Header) == 0 {
 			return errors.New("文件请求为空")
 		}
+		if len(p.requestedFiles) != 0 {
+			return p.sendJSON(map[string]any{"type": "files-transfer-response", "accepted": false})
+		}
+		var total int64
+		for _, file := range msg.Header {
+			if file.Size < 0 || file.Size > (1<<40)-total {
+				return errors.New("文件大小无效或总量超过 1TB")
+			}
+			total += file.Size
+		}
+		if total != msg.TotalSize {
+			return errors.New("总大小不一致")
+		}
 		p.requestedFiles = append([]FileMeta(nil), msg.Header...)
 		p.totalSize = msg.TotalSize
 		p.completedBytes = 0
 		p.lastProgress = 0
-		log.Printf("收到 %d 个文件的发送请求（共 %.2f MB），已自动接受", len(msg.Header), float64(msg.TotalSize)/1024/1024)
+		p.owner.logf("收到 %d 个文件的发送请求（共 %.2f MB），已自动接受", len(msg.Header), float64(msg.TotalSize)/1024/1024)
 		return p.sendJSON(map[string]any{"type": "files-transfer-response", "accepted": true})
 	case "header":
 		if len(p.requestedFiles) == 0 {
@@ -473,12 +494,12 @@ func (p *remotePeer) handleDataMessage(message webrtc.DataChannelMessage) error 
 		if err != nil {
 			return err
 		}
-		log.Printf("收到文本: %s", decoded)
+		p.owner.logf("收到文本: %s", decoded)
 		return p.sendJSON(map[string]any{"type": "message-transfer-complete"})
 	case "display-name-changed", "progress":
 		return nil
 	default:
-		log.Printf("忽略数据通道消息: %s", msg.Type)
+		p.owner.logf("忽略数据通道消息: %s", msg.Type)
 		return nil
 	}
 }
@@ -487,7 +508,7 @@ func (p *remotePeer) startFile(meta FileMeta) error {
 	if p.currentFile != nil {
 		return errors.New("上一个文件尚未接收完")
 	}
-	finalPath, err := availablePath(filepath.Base(meta.Name))
+	finalPath, err := availablePath(p.owner.config.SaveDir, meta.Name)
 	if err != nil {
 		return err
 	}
@@ -497,7 +518,8 @@ func (p *remotePeer) startFile(meta FileMeta) error {
 		return err
 	}
 	p.currentFile = &incomingFile{meta: meta, file: file, tempPath: tempPath, finalPath: finalPath}
-	log.Printf("开始接收文件 %q（%.2f MB）", meta.Name, float64(meta.Size)/1024/1024)
+	p.owner.transfer(p.id, meta.Name, 0, meta.Size, "接收中", "")
+	p.owner.logf("开始接收文件 %q（%.2f MB）", meta.Name, float64(meta.Size)/1024/1024)
 	if meta.Size == 0 {
 		return p.finishFile()
 	}
@@ -526,6 +548,7 @@ func (p *remotePeer) writeChunk(data []byte) error {
 			return err
 		}
 		p.lastProgress = progress
+		p.owner.transfer(p.id, current.meta.Name, current.received, current.meta.Size, "接收中", "")
 	}
 	if current.received == current.meta.Size {
 		return p.finishFile()
@@ -544,7 +567,8 @@ func (p *remotePeer) finishFile() error {
 	if err := os.Rename(current.tempPath, current.finalPath); err != nil {
 		return err
 	}
-	log.Printf("文件接收完毕: %s", current.finalPath)
+	p.owner.transfer(p.id, current.meta.Name, current.meta.Size, current.meta.Size, "已完成", current.finalPath)
+	p.owner.logf("文件接收完毕: %s", current.finalPath)
 	p.currentFile = nil
 	p.completedBytes += current.meta.Size
 	progress := float64(p.completedBytes) / float64(p.totalSize)
@@ -590,9 +614,11 @@ func (p *remotePeer) abortIncomingFile() {
 	if p.currentFile == nil {
 		return
 	}
+	p.owner.transfer(p.id, p.currentFile.meta.Name, p.currentFile.received, p.currentFile.meta.Size, "已中断", "")
 	_ = p.currentFile.file.Close()
 	_ = os.Remove(p.currentFile.tempPath)
 	p.currentFile = nil
+	p.requestedFiles = nil
 }
 
 func (n *Node) removePeer(id string) {
@@ -613,11 +639,15 @@ func (n *Node) removePeerIfCurrent(id string, expected *remotePeer) {
 	}
 	peer.closeIncomingFile()
 	_ = peer.pc.Close()
-	log.Printf("设备已离开: %s", id)
+	n.device(id, "", "离线")
+	n.logf("设备已离开: %s", id)
 }
 
-func availablePath(name string) (string, error) {
+func availablePath(dir, name string) (string, error) {
 	name = strings.TrimSpace(name)
+	if !filepath.IsLocal(name) || strings.ContainsAny(name, `/\\:`) {
+		return "", errors.New("无效文件名")
+	}
 	if name == "" || name == "." || name == string(filepath.Separator) {
 		return "", errors.New("无效文件名")
 	}
@@ -628,10 +658,15 @@ func availablePath(name string) (string, error) {
 		if i > 0 {
 			candidate = fmt.Sprintf("%s (%d)%s", base, i, ext)
 		}
+		candidate = filepath.Join(dir, candidate)
 		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
 			if _, err := os.Stat(candidate + ".part"); errors.Is(err, os.ErrNotExist) {
 				return candidate, nil
+			} else if err != nil {
+				return "", err
 			}
+		} else if err != nil {
+			return "", err
 		}
 	}
 }

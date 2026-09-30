@@ -1,0 +1,153 @@
+// Package pairdrop implements a reconnecting PairDrop file receiver.
+package pairdrop
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"time"
+
+	"github.com/pion/webrtc/v3"
+)
+
+// Config is immutable after New. Use one running client per IdentityPath.
+type Config struct {
+	SaveDir      string
+	IdentityPath string
+	Room         string
+	ServerURL    string
+	RetryDelay   time.Duration
+}
+
+type Device struct{ ID, Name, State string }
+type Transfer struct {
+	PeerID, Name, State, Path string
+	Received, Size            int64
+}
+
+// Snapshot contains independent copies and is safe for GUI polling.
+type Snapshot struct {
+	Status, Name string
+	Devices      []Device
+	Transfers    []Transfer
+	Logs         []string
+}
+
+func New(config Config) (*Node, error) {
+	if config.Room != "" && !regexp.MustCompile("^[a-z]{5}$").MatchString(config.Room) {
+		return nil, errors.New("公共房间必须是五个小写英文字母")
+	}
+	if config.SaveDir == "" {
+		config.SaveDir = "."
+	}
+	var err error
+	config.SaveDir, err = filepath.Abs(config.SaveDir)
+	if err != nil {
+		return nil, err
+	}
+	if err = os.MkdirAll(config.SaveDir, 0755); err != nil {
+		return nil, err
+	}
+	if config.IdentityPath == "" {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return nil, err
+		}
+		config.IdentityPath = filepath.Join(dir, "PairDropGo", identityFile)
+	}
+	config.IdentityPath, err = filepath.Abs(config.IdentityPath)
+	if err != nil {
+		return nil, err
+	}
+	if err = os.MkdirAll(filepath.Dir(config.IdentityPath), 0700); err != nil {
+		return nil, err
+	}
+	if config.ServerURL == "" {
+		config.ServerURL = pairDropURL
+	}
+	if config.RetryDelay <= 0 {
+		config.RetryDelay = 3 * time.Second
+	}
+	return &Node{config: config, room: config.Room, peers: make(map[string]*remotePeer),
+		view: Snapshot{Status: "未连接"},
+		rtc:  webrtc.Configuration{ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}},
+	}, nil
+}
+
+// Run blocks until ctx is cancelled. Network failures reconnect automatically.
+// Concurrent Run calls on the same client are rejected.
+func (n *Node) Run(ctx context.Context) error {
+	if !n.running.CompareAndSwap(false, true) {
+		return errors.New("客户端已经运行")
+	}
+	defer n.running.Store(false)
+	defer n.setStatus("已停止", "")
+	n.run(ctx, n.config.ServerURL, n.config.RetryDelay)
+	return nil
+}
+
+func (n *Node) Snapshot() Snapshot {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	s := n.view
+	s.Devices = append([]Device(nil), s.Devices...)
+	s.Transfers = append([]Transfer(nil), s.Transfers...)
+	s.Logs = append([]string(nil), s.Logs...)
+	return s
+}
+
+func (n *Node) logf(format string, args ...any) {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	n.view.Logs = append(n.view.Logs, time.Now().Format("15:04:05")+"  "+fmt.Sprintf(format, args...))
+	if len(n.view.Logs) > 150 {
+		n.view.Logs = n.view.Logs[len(n.view.Logs)-150:]
+	}
+}
+func (n *Node) setStatus(status, name string) {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	n.view.Status = status
+	if name != "" {
+		n.view.Name = name
+	}
+}
+func (n *Node) device(id, name, state string) {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	for i := range n.view.Devices {
+		if n.view.Devices[i].ID == id {
+			if name != "" {
+				n.view.Devices[i].Name = name
+			}
+			n.view.Devices[i].State = state
+			return
+		}
+	}
+	if state == "closed" || state == "离线" {
+		return
+	}
+	if len(n.view.Devices) >= 100 {
+		n.view.Devices = n.view.Devices[1:]
+	}
+	n.view.Devices = append(n.view.Devices, Device{id, name, state})
+}
+func (n *Node) transfer(id, name string, received, size int64, state, path string) {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	item := Transfer{id, name, state, path, received, size}
+	for i := len(n.view.Transfers) - 1; i >= 0; i-- {
+		t := n.view.Transfers[i]
+		if t.PeerID == id && t.Name == name && t.State == "接收中" {
+			n.view.Transfers[i] = item
+			return
+		}
+	}
+	if len(n.view.Transfers) >= 100 {
+		n.view.Transfers = n.view.Transfers[1:]
+	}
+	n.view.Transfers = append(n.view.Transfers, item)
+}
