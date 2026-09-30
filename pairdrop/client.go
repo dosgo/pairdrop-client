@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -67,6 +69,20 @@ type DataMessage struct {
 	Mime      string     `json:"mime,omitempty"`
 	Offset    int64      `json:"offset,omitempty"`
 	Text      string     `json:"text,omitempty"`
+	Accepted  bool       `json:"accepted,omitempty"`
+}
+
+// 发送参数与 PairDrop 网页端保持一致：64 KB 分块，每累计 1 MB 需要一次 partition 确认。
+const (
+	sendChunkSize        = 64000
+	sendMaxPartitionSize = 1000000
+)
+
+// sendReply 是发送流程等待的对端回执。
+type sendReply struct {
+	kind     string // response / partition / complete
+	offset   int64
+	accepted bool
 }
 
 type incomingFile struct {
@@ -93,6 +109,11 @@ type remotePeer struct {
 	totalSize      int64
 	completedBytes int64
 	lastProgress   float64
+
+	sendCh       chan []string
+	sendReplies  chan sendReply
+	sendQuit     chan struct{}
+	sendQuitOnce sync.Once
 }
 
 type Node struct {
@@ -184,6 +205,7 @@ func (n *Node) close() {
 	n.peers = make(map[string]*remotePeer)
 	n.mu.Unlock()
 	for _, peer := range peers {
+		peer.stopSend()
 		peer.closeIncomingFile()
 		_ = peer.pc.Close()
 	}
@@ -306,6 +328,15 @@ func saveIdentity(path string, saved identity) error {
 	return os.Rename(temp, path)
 }
 
+func newRemotePeer(n *Node, id, roomType, roomID string, pc *webrtc.PeerConnection) *remotePeer {
+	return &remotePeer{
+		owner: n, id: id, roomType: roomType, roomID: roomID, pc: pc,
+		sendCh:      make(chan []string, 1),
+		sendReplies: make(chan sendReply, 8),
+		sendQuit:    make(chan struct{}),
+	}
+}
+
 func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer, error) {
 	n.mu.Lock()
 	if peer := n.peers[id]; peer != nil {
@@ -323,7 +354,7 @@ func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer
 	if err != nil {
 		return nil, err
 	}
-	peer := &remotePeer{owner: n, id: id, roomType: roomType, roomID: roomID, pc: pc}
+	peer := newRemotePeer(n, id, roomType, roomID, pc)
 
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
@@ -351,6 +382,7 @@ func (n *Node) ensurePeer(id, roomType, roomID string, caller bool) (*remotePeer
 	}
 	n.peers[id] = peer
 	n.mu.Unlock()
+	go peer.sendLoop()
 
 	if caller {
 		dc, err := pc.CreateDataChannel("data-channel", nil)
@@ -432,8 +464,8 @@ func (n *Node) bindDataChannel(peer *remotePeer, dc *webrtc.DataChannel) {
 	peer.dc = dc
 	peer.mu.Unlock()
 	dc.OnOpen(func() {
-		n.device(peer.id, "", "可接收文件")
-		n.logf("已与设备 [%s] 建立数据通道，可以从网页端发送文件", peer.id)
+		n.device(peer.id, "", "可收发文件")
+		n.logf("已与设备 [%s] 建立数据通道，可收发文件", peer.id)
 	})
 	dc.OnMessage(func(message webrtc.DataChannelMessage) {
 		if err := peer.handleDataMessage(message); err != nil {
@@ -496,6 +528,15 @@ func (p *remotePeer) handleDataMessage(message webrtc.DataChannelMessage) error 
 		}
 		p.owner.logf("收到文本: %s", decoded)
 		return p.sendJSON(map[string]any{"type": "message-transfer-complete"})
+	case "files-transfer-response":
+		p.reply(sendReply{kind: "response", accepted: msg.Accepted})
+		return nil
+	case "partition-received":
+		p.reply(sendReply{kind: "partition", offset: msg.Offset})
+		return nil
+	case "file-transfer-complete":
+		p.reply(sendReply{kind: "complete"})
+		return nil
 	case "display-name-changed", "progress":
 		return nil
 	default:
@@ -588,14 +629,214 @@ func (p *remotePeer) finishFile() error {
 }
 
 func (p *remotePeer) sendJSON(message any) error {
+	return sendJSONOn(p.dc, message)
+}
+
+func sendJSONOn(dc *webrtc.DataChannel, message any) error {
 	data, err := json.Marshal(message)
 	if err != nil {
 		return err
 	}
-	if p.dc == nil {
+	if dc == nil {
 		return errors.New("数据通道尚未建立")
 	}
-	return p.dc.SendText(string(data))
+	return dc.SendText(string(data))
+}
+
+// reply 把对端回执投递给发送协程，非阻塞以避免卡住数据通道回调。
+func (p *remotePeer) reply(r sendReply) {
+	select {
+	case p.sendReplies <- r:
+	default:
+	}
+}
+
+func (p *remotePeer) stopSend() {
+	p.sendQuitOnce.Do(func() { close(p.sendQuit) })
+}
+
+func (p *remotePeer) isQuit() bool {
+	select {
+	case <-p.sendQuit:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *remotePeer) waitReply() (sendReply, bool) {
+	select {
+	case <-p.sendQuit:
+		return sendReply{}, false
+	case r := <-p.sendReplies:
+		return r, true
+	}
+}
+
+// enqueue 把待发送文件排入队列；同一设备同一时刻只处理一批。
+func (p *remotePeer) enqueue(paths []string) error {
+	select {
+	case p.sendCh <- paths:
+		return nil
+	default:
+		return errors.New("该设备正在发送其他文件，请稍后再试")
+	}
+}
+
+func (p *remotePeer) sendLoop() {
+	for {
+		select {
+		case <-p.sendQuit:
+			return
+		case paths := <-p.sendCh:
+			p.runSend(paths)
+		}
+	}
+}
+
+func (p *remotePeer) runSend(paths []string) {
+	p.mu.Lock()
+	dc := p.dc
+	p.mu.Unlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		p.owner.logf("设备 [%s] 数据通道未就绪，取消发送", p.id)
+		return
+	}
+
+	metas := make([]FileMeta, 0, len(paths))
+	files := make([]*os.File, 0, len(paths))
+	var total int64
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			p.owner.logf("读取文件失败 %s: %v", path, err)
+			closeFiles(files)
+			return
+		}
+		if info.IsDir() {
+			p.owner.logf("暂不支持发送文件夹: %s", path)
+			closeFiles(files)
+			return
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			p.owner.logf("打开文件失败 %s: %v", path, err)
+			closeFiles(files)
+			return
+		}
+		files = append(files, file)
+		metas = append(metas, FileMeta{Name: filepath.Base(path), Size: info.Size(), Mime: mimeOf(path)})
+		total += info.Size()
+	}
+	defer closeFiles(files)
+
+	p.owner.logf("正在向设备 [%s] 发送 %d 个文件（共 %.2f MB）", p.id, len(metas), float64(total)/1024/1024)
+	if err := sendJSONOn(dc, map[string]any{
+		"type":             "request",
+		"header":           metas,
+		"totalSize":        total,
+		"imagesOnly":       false,
+		"thumbnailDataUrl": "",
+	}); err != nil {
+		p.owner.logf("发送文件请求失败: %v", err)
+		return
+	}
+	reply, ok := p.waitReply()
+	if !ok {
+		return
+	}
+	if reply.kind != "response" || !reply.accepted {
+		p.owner.logf("设备 [%s] 拒绝了文件发送", p.id)
+		return
+	}
+	for i, meta := range metas {
+		if !p.sendOneFile(dc, files[i], meta) {
+			return
+		}
+	}
+	p.owner.logf("已向设备 [%s] 发送完毕 %d 个文件", p.id, len(metas))
+}
+
+func (p *remotePeer) sendOneFile(dc *webrtc.DataChannel, file *os.File, meta FileMeta) bool {
+	if err := sendJSONOn(dc, map[string]any{"type": "header", "name": meta.Name, "size": meta.Size, "mime": meta.Mime}); err != nil {
+		p.owner.logf("发送文件头失败: %v", err)
+		return false
+	}
+	p.owner.transfer(p.id, meta.Name, 0, meta.Size, "发送中", "")
+
+	buf := make([]byte, sendChunkSize)
+	var offset, partition, reported int64
+	for {
+		if p.isQuit() {
+			p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+			return false
+		}
+		n, err := file.Read(buf)
+		if n > 0 {
+			if sendErr := dc.Send(buf[:n]); sendErr != nil {
+				p.owner.logf("数据通道发送失败: %v", sendErr)
+				p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+				return false
+			}
+			offset += int64(n)
+			partition += int64(n)
+			if offset == meta.Size || offset-reported >= 1<<20 {
+				reported = offset
+				p.owner.transfer(p.id, meta.Name, offset, meta.Size, "发送中", "")
+			}
+			if partition >= sendMaxPartitionSize && offset < meta.Size {
+				if sendErr := sendJSONOn(dc, map[string]any{"type": "partition", "offset": offset}); sendErr != nil {
+					p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+					return false
+				}
+				reply, ok := p.waitReply()
+				if !ok {
+					p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+					return false
+				}
+				if reply.kind != "partition" {
+					p.owner.logf("等待分段确认时收到意外回执: %s", reply.kind)
+					p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+					return false
+				}
+				partition = 0
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			p.owner.logf("读取文件失败: %v", err)
+			p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+			return false
+		}
+	}
+
+	reply, ok := p.waitReply()
+	if !ok {
+		return false
+	}
+	if reply.kind != "complete" {
+		p.owner.logf("等待文件完成确认失败: %s", reply.kind)
+		p.owner.transfer(p.id, meta.Name, offset, meta.Size, "已中断", "")
+		return false
+	}
+	p.owner.transfer(p.id, meta.Name, meta.Size, meta.Size, "已发送", "")
+	p.owner.logf("文件发送完毕: %s", meta.Name)
+	return true
+}
+
+func closeFiles(files []*os.File) {
+	for _, file := range files {
+		_ = file.Close()
+	}
+}
+
+func mimeOf(path string) string {
+	if detected := mime.TypeByExtension(filepath.Ext(path)); detected != "" {
+		return detected
+	}
+	return "application/octet-stream"
 }
 
 func (p *remotePeer) closeIncomingFile() {
@@ -637,6 +878,7 @@ func (n *Node) removePeerIfCurrent(id string, expected *remotePeer) {
 	if peer == nil {
 		return
 	}
+	peer.stopSend()
 	peer.closeIncomingFile()
 	_ = peer.pc.Close()
 	n.device(id, "", "离线")

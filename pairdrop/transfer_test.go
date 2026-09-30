@@ -143,6 +143,159 @@ func TestDataChannelTransfer(t *testing.T) {
 	}
 }
 
+func TestSendFilesToPeer(t *testing.T) {
+	dir := t.TempDir()
+	node, err := New(Config{SaveDir: dir, IdentityPath: filepath.Join(t.TempDir(), "identity.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("PairDrop send test!"), 100000)
+	binPath := filepath.Join(dir, "send.bin")
+	if err := os.WriteFile(binPath, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	emptyPath := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(emptyPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	senderPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderPC.Close()
+	remotePC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remotePC.Close()
+
+	peer := newRemotePeer(node, "remote", "", "", senderPC)
+	go peer.sendLoop()
+	defer peer.stopSend()
+
+	type received struct {
+		meta FileMeta
+		data []byte
+	}
+	completed := make(chan received, 4)
+	// remotePC 模拟网页端接收方：按 PairDrop 协议回应 response/partition/complete。
+	remotePC.OnDataChannel(func(dc *webrtc.DataChannel) {
+		var pendingMeta []FileMeta
+		var idx int
+		var buf []byte
+		var expected int64
+		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			if !m.IsString {
+				buf = append(buf, m.Data...)
+				if expected > 0 && int64(len(buf)) == expected {
+					completed <- received{meta: pendingMeta[idx], data: append([]byte(nil), buf...)}
+					idx++
+					buf = nil
+					_ = dc.SendText(`{"type":"file-transfer-complete"}`)
+				}
+				return
+			}
+			var msg DataMessage
+			if err := json.Unmarshal(m.Data, &msg); err != nil {
+				t.Errorf("invalid message: %v", err)
+				return
+			}
+			switch msg.Type {
+			case "request":
+				pendingMeta = append([]FileMeta(nil), msg.Header...)
+				idx, buf, expected = 0, nil, 0
+				_ = dc.SendText(`{"type":"files-transfer-response","accepted":true}`)
+			case "header":
+				buf, expected = nil, msg.Size
+				if msg.Size == 0 {
+					completed <- received{meta: pendingMeta[idx]}
+					idx++
+					_ = dc.SendText(`{"type":"file-transfer-complete"}`)
+				}
+			case "partition":
+				data, _ := json.Marshal(map[string]any{"type": "partition-received", "offset": msg.Offset})
+				_ = dc.SendText(string(data))
+			}
+		})
+	})
+
+	dc, err := senderPC.CreateDataChannel("data-channel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.bindDataChannel(peer, dc)
+	node.mu.Lock()
+	node.peers["remote"] = peer
+	node.mu.Unlock()
+
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+	offer, err := senderPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gathering := webrtc.GatheringCompletePromise(senderPC)
+	if err = senderPC.SetLocalDescription(offer); err != nil {
+		t.Fatal(err)
+	}
+	<-gathering
+	if err = remotePC.SetRemoteDescription(*senderPC.LocalDescription()); err != nil {
+		t.Fatal(err)
+	}
+	answer, err := remotePC.CreateAnswer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gathering = webrtc.GatheringCompletePromise(remotePC)
+	if err = remotePC.SetLocalDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+	<-gathering
+	if err = senderPC.SetRemoteDescription(*remotePC.LocalDescription()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("channel did not open")
+	}
+
+	if err = node.SendFiles("remote", []string{binPath, emptyPath}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make([]received, 0, 2)
+	timeout := time.NewTimer(20 * time.Second)
+	defer timeout.Stop()
+	for len(got) < 2 {
+		select {
+		case r := <-completed:
+			got = append(got, r)
+		case <-timeout.C:
+			t.Fatalf("timeout waiting for files; logs: %v", node.Snapshot().Logs)
+		}
+	}
+	if got[0].meta.Name != "send.bin" || !bytes.Equal(got[0].data, payload) {
+		t.Fatalf("send.bin mismatch: %+v", got[0].meta)
+	}
+	if got[1].meta.Name != "empty.txt" || len(got[1].data) != 0 {
+		t.Fatalf("empty.txt mismatch: %+v", got[1].meta)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		transfers := node.Snapshot().Transfers
+		if len(transfers) == 2 && transfers[0].State == "已发送" && transfers[1].State == "已发送" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sender transfer records not complete: %v", transfers)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestAvailablePathAndSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"../escape", "..", "file:stream", "a/b", "a\\b"} {

@@ -89,6 +89,28 @@ func (n *Node) Run(ctx context.Context) error {
 	return nil
 }
 
+// SendFiles sends the given local files to the peer identified by id.
+// It returns immediately; the transfer runs in the background and progress can
+// be observed through Snapshot. Only one batch per device may run at a time.
+func (n *Node) SendFiles(id string, paths []string) error {
+	if len(paths) == 0 {
+		return errors.New("未选择任何文件")
+	}
+	n.mu.Lock()
+	peer := n.peers[id]
+	n.mu.Unlock()
+	if peer == nil {
+		return fmt.Errorf("设备 %s 不在线", id)
+	}
+	peer.mu.Lock()
+	dc := peer.dc
+	peer.mu.Unlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return errors.New("尚未与该设备建立可用的数据通道")
+	}
+	return peer.enqueue(paths)
+}
+
 func (n *Node) Snapshot() Snapshot {
 	n.viewMu.Lock()
 	defer n.viewMu.Unlock()
@@ -141,7 +163,7 @@ func (n *Node) transfer(id, name string, received, size int64, state, path strin
 	item := Transfer{id, name, state, path, received, size}
 	for i := len(n.view.Transfers) - 1; i >= 0; i-- {
 		t := n.view.Transfers[i]
-		if t.PeerID == id && t.Name == name && t.State == "接收中" {
+		if t.PeerID == id && t.Name == name && (t.State == "接收中" || t.State == "发送中") {
 			n.view.Transfers[i] = item
 			return
 		}
