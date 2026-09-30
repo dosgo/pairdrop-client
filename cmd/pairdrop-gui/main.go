@@ -195,15 +195,15 @@ func setupUI(w fyne.Window, smoke bool) {
 		refresh()
 	}
 
-	startBtn.OnClicked = startRun
-	stopBtn.OnClicked = func() {
+	startBtn.OnTapped = startRun
+	stopBtn.OnTapped = func() {
 		if cancel != nil {
 			cancel()
 			stopBtn.Disable()
 			statusLabel.SetText("正在停止……")
 		}
 	}
-	browseBtn.OnClicked = func() {
+	browseBtn.OnTapped = func() {
 		chooser := dialog.NewFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil {
 				dialog.ShowError(err, w)
@@ -215,7 +215,7 @@ func setupUI(w fyne.Window, smoke bool) {
 		}, w)
 		chooser.Show()
 	}
-	openBtn.OnClicked = func() {
+	openBtn.OnTapped = func() {
 		dir, err := filepath.Abs(strings.TrimSpace(folderEntry.Text))
 		if err != nil {
 			dialog.ShowError(err, w)
