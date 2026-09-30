@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/pion/webrtc/v3"
@@ -156,6 +157,25 @@ func (n *Node) device(id, name, state string) {
 		n.view.Devices = n.view.Devices[1:]
 	}
 	n.view.Devices = append(n.view.Devices, Device{id, name, state})
+}
+
+// renameDevice updates only the display name of an already known device,
+// keeping its state (e.g. "可收发文件") intact. Device names are stored as
+// "显示名 / 设备名", so only the leading display name is replaced.
+func (n *Node) renameDevice(id, displayName string) {
+	n.viewMu.Lock()
+	defer n.viewMu.Unlock()
+	for i := range n.view.Devices {
+		if n.view.Devices[i].ID != id {
+			continue
+		}
+		if _, deviceName, ok := strings.Cut(n.view.Devices[i].Name, " / "); ok {
+			n.view.Devices[i].Name = displayName + " / " + deviceName
+		} else {
+			n.view.Devices[i].Name = displayName
+		}
+		return
+	}
 }
 func (n *Node) transfer(id, name string, received, size int64, state, path string) {
 	n.viewMu.Lock()

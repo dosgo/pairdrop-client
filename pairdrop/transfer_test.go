@@ -296,6 +296,29 @@ func TestSendFilesToPeer(t *testing.T) {
 	}
 }
 
+func TestDisplayNameChanged(t *testing.T) {
+	dir := t.TempDir()
+	node, err := New(Config{SaveDir: dir, IdentityPath: filepath.Join(dir, "identity.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.device("peer-1", "Turquoise Whale / Windows Chrome", "可收发文件")
+	peer := newRemotePeer(node, "peer-1", "", "", nil)
+
+	// 网页端改名后只通过数据通道广播 display-name-changed。
+	payload, _ := json.Marshal(map[string]any{"type": "display-name-changed", "displayName": "十三pc"})
+	if err := peer.handleDataMessage(webrtc.DataChannelMessage{IsString: true, Data: payload}); err != nil {
+		t.Fatal(err)
+	}
+	device := node.Snapshot().Devices[0]
+	if device.Name != "十三pc / Windows Chrome" {
+		t.Fatalf("display name not updated: %q", device.Name)
+	}
+	if device.State != "可收发文件" {
+		t.Fatalf("state must be preserved: %q", device.State)
+	}
+}
+
 func TestAvailablePathAndSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"../escape", "..", "file:stream", "a/b", "a\\b"} {

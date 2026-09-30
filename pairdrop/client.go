@@ -61,15 +61,16 @@ type FileMeta struct {
 }
 
 type DataMessage struct {
-	Type      string     `json:"type"`
-	Header    []FileMeta `json:"header,omitempty"`
-	TotalSize int64      `json:"totalSize,omitempty"`
-	Name      string     `json:"name,omitempty"`
-	Size      int64      `json:"size,omitempty"`
-	Mime      string     `json:"mime,omitempty"`
-	Offset    int64      `json:"offset,omitempty"`
-	Text      string     `json:"text,omitempty"`
-	Accepted  bool       `json:"accepted,omitempty"`
+	Type        string     `json:"type"`
+	Header      []FileMeta `json:"header,omitempty"`
+	TotalSize   int64      `json:"totalSize,omitempty"`
+	Name        string     `json:"name,omitempty"`
+	Size        int64      `json:"size,omitempty"`
+	Mime        string     `json:"mime,omitempty"`
+	Offset      int64      `json:"offset,omitempty"`
+	Text        string     `json:"text,omitempty"`
+	Accepted    bool       `json:"accepted,omitempty"`
+	DisplayName string     `json:"displayName,omitempty"`
 }
 
 // 发送参数与 PairDrop 网页端保持一致：64 KB 分块，每累计 1 MB 需要一次 partition 确认。
@@ -537,7 +538,13 @@ func (p *remotePeer) handleDataMessage(message webrtc.DataChannelMessage) error 
 	case "file-transfer-complete":
 		p.reply(sendReply{kind: "complete"})
 		return nil
-	case "display-name-changed", "progress":
+	case "display-name-changed":
+		if msg.DisplayName != "" {
+			p.owner.renameDevice(p.id, msg.DisplayName)
+			p.owner.logf("设备 %s 已将名称改为 %q", p.id, msg.DisplayName)
+		}
+		return nil
+	case "progress":
 		return nil
 	default:
 		p.owner.logf("忽略数据通道消息: %s", msg.Type)
